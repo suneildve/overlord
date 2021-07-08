@@ -13,8 +13,6 @@ import (
 const (
 	opened = int32(0)
 	closed = int32(1)
-
-	pipeMaxCount = 32
 )
 
 var (
@@ -30,23 +28,25 @@ type NodeConnPipe struct {
 
 	errCh chan error
 
-	state int32
+	state        int32
+	pipeMaxCount int
 }
 
 // NewNodeConnPipe new NodeConnPipe.
-func NewNodeConnPipe(conns int32, newNc func() NodeConn) (ncp *NodeConnPipe) {
+func NewNodeConnPipe(conns int32, pipeMaxCount int, newNc func() NodeConn) (ncp *NodeConnPipe) {
 	if conns <= 0 {
 		panic("the number of connections cannot be zero")
 	}
 	ncp = &NodeConnPipe{
-		conns:  conns,
-		inputs: make([]chan *Message, conns),
-		mps:    make([]*msgPipe, conns),
-		errCh:  make(chan error, 1),
+		conns:        conns,
+		inputs:       make([]chan *Message, conns),
+		mps:          make([]*msgPipe, conns),
+		errCh:        make(chan error, 1),
+		pipeMaxCount: pipeMaxCount,
 	}
 	for i := int32(0); i < ncp.conns; i++ {
 		ncp.inputs[i] = make(chan *Message, pipeMaxCount*pipeMaxCount*16)
-		ncp.mps[i] = newMsgPipe(ncp.inputs[i], newNc, ncp.errCh)
+		ncp.mps[i] = newMsgPipe(pipeMaxCount, ncp.inputs[i], newNc, ncp)
 	}
 	return
 }
@@ -89,8 +89,8 @@ func (ncp *NodeConnPipe) ErrorEvent() <-chan error {
 
 // Close close pipe.
 func (ncp *NodeConnPipe) Close() {
-	close(ncp.errCh)
 	ncp.l.Lock()
+	close(ncp.errCh)
 	ncp.state = closed
 	for _, input := range ncp.inputs {
 		close(input)
@@ -104,18 +104,21 @@ type msgPipe struct {
 	newNc func() NodeConn
 	input <-chan *Message
 
-	batch [pipeMaxCount]*Message
-	count int
+	batch        []*Message
+	pipeMaxCount int
+	count        int
 
-	errCh chan<- error
+	ncp *NodeConnPipe
 }
 
 // newMsgPipe new msgPipe and return.
-func newMsgPipe(input <-chan *Message, newNc func() NodeConn, errCh chan<- error) (mp *msgPipe) {
+func newMsgPipe(pipeMaxCount int, input <-chan *Message, newNc func() NodeConn, ncp *NodeConnPipe) (mp *msgPipe) {
 	mp = &msgPipe{
-		newNc: newNc,
-		input: input,
-		errCh: errCh,
+		newNc:        newNc,
+		input:        input,
+		ncp:          ncp,
+		batch:        make([]*Message, pipeMaxCount),
+		pipeMaxCount: pipeMaxCount,
 	}
 	mp.nc.Store(newNc())
 	go mp.pipe()
@@ -154,7 +157,7 @@ func (mp *msgPipe) pipe() {
 			if err != nil {
 				goto MEND
 			}
-			if mp.count >= pipeMaxCount {
+			if mp.count >= mp.pipeMaxCount {
 				break
 			}
 		}
@@ -205,10 +208,12 @@ func (mp *msgPipe) pipe() {
 
 func (mp *msgPipe) reNewNc(nc NodeConn, err error) NodeConn {
 	if err != nil {
+		mp.ncp.l.Lock()
 		select {
-		case mp.errCh <- err: // NOTE: action
+		case mp.ncp.errCh <- err: // NOTE: action
 		default:
 		}
+		mp.ncp.l.Unlock()
 	}
 	nc.Close()
 	mp.nc.Store(mp.newNc())

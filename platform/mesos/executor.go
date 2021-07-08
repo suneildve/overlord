@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"overlord/pkg/container"
 	"overlord/pkg/etcd"
 	"overlord/pkg/log"
 	"overlord/pkg/memcache"
@@ -47,6 +48,7 @@ type Executor struct {
 	failedTasks    map[ms.TaskID]ms.TaskStatus // send updates for these as we can
 	shouldQuit     bool
 	p              *proc.Proc
+	c              *container.Container
 }
 
 const (
@@ -147,7 +149,11 @@ func (ec *Executor) launch(e *executor.Event) (err error) {
 		log.Errorf("get deploy info err %v", err)
 		return
 	}
-	ec.p, err = create.SetupCacheService(dpinfo)
+	if dpinfo.Image != "" {
+		ec.c, err = create.SetupCacheContainer(dpinfo)
+	} else {
+		ec.p, err = create.SetupCacheService(dpinfo)
+	}
 	if err != nil {
 		log.Errorf("start cache service err %v", err)
 		return
@@ -211,7 +217,9 @@ type Pinger interface {
 // Run start executor.
 func (ec *Executor) Run(c context.Context) {
 	defer func() {
-		if ec.p != nil {
+		if ec.c != nil {
+			ec.c.Stop()
+		} else if ec.p != nil {
 			ec.p.Stop()
 		}
 	}()
@@ -238,7 +246,7 @@ func (ec *Executor) Run(c context.Context) {
 			log.Infof("gracefully exiting because framework checkpointing is NOT enabled")
 			return
 		}
-		if time.Now().Sub(disconnected) > ec.cfg.RecoveryTimeout {
+		if time.Since(disconnected) > ec.cfg.RecoveryTimeout {
 			log.Infof("failed to re-establish subscription with agent within %v, aborting", ec.cfg.RecoveryTimeout)
 			return
 		}
@@ -248,10 +256,14 @@ func (ec *Executor) Run(c context.Context) {
 
 func (ec *Executor) quitCheck() {
 	for {
-		if ec.p != nil {
+		if ec.c != nil {
+			log.Infof("executor exit with err %v", ec.c.Wait())
+			os.Exit(0)
+		} else if ec.p != nil {
 			log.Infof("executor exit with err %v", ec.p.Wait())
 			os.Exit(0)
 		}
+
 		time.Sleep(time.Second * 5)
 	}
 }
@@ -311,8 +323,8 @@ func (ec *Executor) newStatus(id ms.TaskID) ms.TaskStatus {
 		TaskID:     id,
 		Source:     ms.SOURCE_EXECUTOR.Enum(),
 		ExecutorID: &ec.executor.ExecutorID,
-		// TODO:rand id
-		UUID: []byte(uuid.NewRandom()),
+		Timestamp:  protoFloat64(float64(time.Now().Unix())),
+		UUID:       []byte(uuid.NewRandom()),
 	}
 }
 
@@ -334,6 +346,8 @@ func (ec *Executor) update(status ms.TaskStatus) error {
 }
 
 func protoString(s string) *string { return &s }
+
+func protoFloat64(f float64) *float64 { return &f }
 
 func (ec *Executor) kill(id ms.TaskID) {
 	status := ec.newStatus(id)

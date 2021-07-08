@@ -130,11 +130,13 @@ func buildHTTPSched(cfg *Config) calls.Caller {
 
 func (s *Scheduler) buildFrameworkInfo() *ms.FrameworkInfo {
 	frameworkInfo := &ms.FrameworkInfo{
-		User:         s.c.User,
-		Name:         s.c.Name,
-		ID:           &ms.FrameworkID{Value: mstore.GetIgnoreErrors(s)()},
-		Checkpoint:   &s.c.Checkpoint,
-		Capabilities: []ms.FrameworkInfo_Capability{ms.FrameworkInfo_Capability{Type: ms.FrameworkInfo_Capability_MULTI_ROLE}},
+		User:       s.c.User,
+		Name:       s.c.Name,
+		ID:         &ms.FrameworkID{Value: mstore.GetIgnoreErrors(s)()},
+		Checkpoint: &s.c.Checkpoint,
+		Capabilities: []ms.FrameworkInfo_Capability{
+			{Type: ms.FrameworkInfo_Capability_MULTI_ROLE},
+		},
 	}
 	if s.c.FailOver > 0 {
 		failOverTimeout := time.Duration(s.c.FailOver).Seconds()
@@ -283,7 +285,7 @@ func (s *Scheduler) tryRecovery(t ms.TaskID, offers []ms.Offer, force bool) (err
 	task := &ms.TaskInfo{
 		Name:      ip + ":" + port,
 		TaskID:    ms.TaskID{Value: fmt.Sprintf("%s:%s-%s-%d", ip, port, cluster, id+1)},
-		Executor:  s.buildExcutor(ip+port, []ms.Resource{}),
+		Executor:  s.buildExcutor(fmt.Sprintf("%s:%s", ip, port), []ms.Resource{}),
 		Resources: makeResources(info.CPU, info.MaxMemory, uport),
 	}
 	data := &TaskData{
@@ -293,10 +295,10 @@ func (s *Scheduler) tryRecovery(t ms.TaskID, offers []ms.Offer, force bool) (err
 	}
 	task.Data, _ = json.Marshal(data)
 	for _, offer := range offers {
+		agentIP := chunk.ValidateIPAddress(offer.Hostname)
 		// try to recover from origin agent with the same info.
-		if offer.Hostname == ip {
-			if !checkOffer(offer, info.CPU, info.MaxMemory, uport) {
-				err = errOffer
+		if agentIP == ip {
+			if err = checkOffer(offer, info.CPU, info.MaxMemory, uport); err != nil {
 				return
 			}
 			task.AgentID = offer.GetAgentID()
@@ -307,7 +309,7 @@ func (s *Scheduler) tryRecovery(t ms.TaskID, offers []ms.Offer, force bool) (err
 				log.Info("recover task successfully")
 				// decline other offer
 				for _, offer := range offers {
-					if offer.Hostname != ip {
+					if agentIP != ip {
 						decline := calls.Decline(offer.ID)
 						calls.CallNoData(context.Background(), s.cli, decline)
 					}
@@ -326,7 +328,7 @@ func (s *Scheduler) tryRecovery(t ms.TaskID, offers []ms.Offer, force bool) (err
 			newDist *chunk.Dist
 		)
 		for i, addr := range info.Dist.Addrs {
-			if addr.String() == ip+port {
+			if addr.String() == fmt.Sprintf("%s:%s", ip, port) {
 				info.Dist.Addrs = append(info.Dist.Addrs[:i], info.Dist.Addrs[i+1:]...)
 				alias = addr.ID
 			}
@@ -369,7 +371,7 @@ func (s *Scheduler) acceptOffer(info *create.CacheInfo, dist *chunk.Dist, offers
 	)
 
 	for _, offer := range offers {
-		ofm[offer.GetHostname()] = offer
+		ofm[chunk.ValidateIPAddress(offer.GetHostname())] = offer
 	}
 	for _, addr := range dist.Addrs {
 		task := ms.TaskInfo{
@@ -392,7 +394,7 @@ func (s *Scheduler) acceptOffer(info *create.CacheInfo, dist *chunk.Dist, offers
 	}
 
 	for _, offer := range offers {
-		accept := calls.Accept(calls.OfferOperations{calls.OpLaunch(tasks[offer.Hostname]...)}.WithOffers(offer.ID))
+		accept := calls.Accept(calls.OfferOperations{calls.OpLaunch(tasks[chunk.ValidateIPAddress(offer.Hostname)]...)}.WithOffers(offer.ID))
 		err = calls.CallNoData(context.Background(), s.cli, accept)
 		if err != nil {
 			err = errors.WithStack(err)
@@ -517,6 +519,7 @@ func (s *Scheduler) dispatchCluster(t job.Job, num int, mem, cpu float64, offers
 		Name:      t.Name,
 		JobID:     t.ID,
 		Version:   t.Version,
+		Image:     t.Image,
 		Number:    t.Num,
 		Group:     t.Group,
 	})
@@ -526,7 +529,7 @@ func (s *Scheduler) dispatchCluster(t job.Job, num int, mem, cpu float64, offers
 		return
 	}
 	for _, offer := range offers {
-		ofm[offer.GetHostname()] = offer
+		ofm[chunk.ValidateIPAddress(offer.GetHostname())] = offer
 	}
 	for _, ck := range jobChunks {
 		for _, node := range ck.Nodes {
@@ -554,7 +557,7 @@ func (s *Scheduler) dispatchCluster(t job.Job, num int, mem, cpu float64, offers
 		}
 	}
 	for _, offer := range offers {
-		accept := calls.Accept(calls.OfferOperations{calls.OpLaunch(tasks[offer.Hostname]...)}.WithOffers(offer.ID))
+		accept := calls.Accept(calls.OfferOperations{calls.OpLaunch(tasks[chunk.ValidateIPAddress(offer.Hostname)]...)}.WithOffers(offer.ID))
 		err = calls.CallNoData(context.Background(), s.cli, accept)
 		if err != nil {
 			err = errors.WithStack(err)
@@ -662,6 +665,7 @@ func (s *Scheduler) dispatchSingleton(t job.Job, offers []ms.Offer) (err error) 
 		Number:    t.Num,
 		Thread:    int(t.CPU) + 1,
 		Version:   t.Version,
+		Image:     t.Image,
 		Dist:      dist,
 		Group:     t.Group,
 	}
@@ -723,7 +727,11 @@ func (s *Scheduler) destroyCluster(t job.Job, offers []ms.Offer) {
 	s.db.RMDir(ctx, fmt.Sprintf("%s/%s", etcd.ClusterDir, ci.Name))
 	for _, node := range nodes {
 		err = s.db.RMDir(ctx, etcd.InstanceDirPrefix+"/"+node.Value)
-		log.Errorf("rm instance dir (%s) fail err %v", node.Value, err)
+		if err != nil {
+			log.Errorf("rm instance dir (%s) fail err %v", node.Value, err)
+		} else {
+			log.Infof("instance dir (%s) removed", node.Value)
+		}
 	}
 }
 
@@ -740,10 +748,9 @@ func (s *Scheduler) restartNode(job job.Job, offers []ms.Offer) (err error) {
 	taskid := ms.TaskID{
 		Value: id,
 	}
-	if err = s.tryRecovery(taskid, offers, true); err == nil {
-		return
+	if err = s.tryRecovery(taskid, offers, true); err != nil {
+		log.Errorf("try restart node from origin agent fail: %v", err)
 	}
-	log.Errorf("try restart node from origin agent fail")
 	return
 }
 

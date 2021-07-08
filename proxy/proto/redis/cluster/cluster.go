@@ -55,20 +55,22 @@ type cluster struct {
 	fakeSlotsBytes []byte
 	once           sync.Once
 
-	state int32
+	state     int32
+	pipeCount int
 }
 
 // NewForwarder new proto Forwarder.
-func NewForwarder(name, listen string, servers []string, conns int32, dto, rto, wto time.Duration, hashTag []byte) proto.Forwarder {
+func NewForwarder(name, listen string, servers []string, conns int32, pipeCount int, dto, rto, wto time.Duration, hashTag []byte) proto.Forwarder {
 	c := &cluster{
-		name:    name,
-		servers: servers,
-		conns:   conns,
-		dto:     dto,
-		rto:     rto,
-		wto:     wto,
-		hashTag: hashTag,
-		action:  make(chan struct{}),
+		name:      name,
+		servers:   servers,
+		conns:     conns,
+		dto:       dto,
+		rto:       rto,
+		wto:       wto,
+		hashTag:   hashTag,
+		action:    make(chan struct{}),
+		pipeCount: pipeCount,
 	}
 	if !c.tryFetch() {
 		_ = c.Close()
@@ -148,10 +150,17 @@ func (c *cluster) fetchproc() {
 	for {
 		select {
 		case <-c.action:
-		case <-time.After(30 * time.Minute):
+		case <-time.After(7 * 24 * time.Hour):
 		}
 		c.tryFetch()
 		time.Sleep(time.Second)
+	}
+}
+
+func (c *cluster) toFetch() {
+	select {
+	case c.action <- struct{}{}:
+	default:
 	}
 }
 
@@ -198,7 +207,7 @@ func (c *cluster) initSlotNode(nSlots *nodeSlots) {
 		ncp, ok := oncp[addr]
 		if !ok {
 			toAddr := addr // NOTE: avoid closure
-			ncp = proto.NewNodeConnPipe(c.conns, func() proto.NodeConn {
+			ncp = proto.NewNodeConnPipe(c.conns, c.pipeCount, func() proto.NodeConn {
 				return newNodeConn(c, toAddr)
 			})
 			go c.pipeEvent(ncp.ErrorEvent())
@@ -209,6 +218,14 @@ func (c *cluster) initSlotNode(nSlots *nodeSlots) {
 			delete(oncp, addr)
 		}
 		sn.nodePipe[addr] = ncp
+	}
+	// check
+	for slot, addr := range sn.nSlots.slots {
+		if np, ok := sn.nodePipe[addr]; addr == "" || !ok || np == nil {
+			log.Warnf("fail to find addr:%s in sn.nodePipe for slot:%d of cluster:%s detail masters:%+v nSlots.slots:%+v", addr, slot, c.name, masters, nSlots.slots)
+			c.toFetch()
+			return
+		}
 	}
 	c.servers = masters
 	c.slotNode.Store(sn)
@@ -229,7 +246,7 @@ func (c *cluster) pipeEvent(errCh <-chan error) {
 		if log.V(2) {
 			log.Errorf("Redis Cluster NodeConnPipe action error:%v", err)
 		}
-		c.action <- struct{}{}
+		c.toFetch()
 	}
 }
 
